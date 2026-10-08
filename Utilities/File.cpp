@@ -244,13 +244,28 @@ static bool is_optical_device_node(const struct ::stat& file_info)
 	return parent_info.st_dev != file_info.st_dev;
 }
 
-// Retrieve the size of a raw device: "fstat()" reports no size (0) on such a device
-static u64 get_raw_device_size(int fd)
+// Retrieve the size of a raw device: "fstat()" reports no size (0) on such a device.
+// A node that refuses the size query itself (ENOTTY) implements no media size at all, so it is
+// no raw device: that is reported through "refused", which lets the caller open such a node as
+// the ordinary file it is instead of taking it for a drive holding no disc. On the BSDs every
+// character device in "/dev" is offered here ("/dev/urandom" among them), unlike on Linux where
+// only a block device with an optical major number is.
+static u64 get_raw_device_size(int fd, bool* refused = nullptr)
 {
+	if (refused)
+	{
+		*refused = false;
+	}
+
 #if defined(__linux__)
 	if (u64 size = 0; ::ioctl(fd, BLKGETSIZE64, &size) == 0)
 	{
 		return size;
+	}
+
+	if (refused && errno == ENOTTY)
+	{
+		*refused = true;
 	}
 #elif defined(__APPLE__)
 	u64 block_count = 0;
@@ -265,10 +280,20 @@ static u64 get_raw_device_size(int fd)
 
 		return block_count * block_size;
 	}
+
+	if (refused && errno == ENOTTY)
+	{
+		*refused = true;
+	}
 #elif defined(__FreeBSD__) || defined(__DragonFly__)
 	if (off_t media_size = 0; ::ioctl(fd, DIOCGMEDIASIZE, &media_size) == 0)
 	{
 		return static_cast<u64>(media_size);
+	}
+
+	if (refused && errno == ENOTTY)
+	{
+		*refused = true;
 	}
 #endif
 
@@ -2113,18 +2138,24 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 	// If path points to an optical raw device, complete the file opening
 	if (raw_device)
 	{
-		// Try to retrieve the size of the content. If it fails, no disc is probably mounted so abort the file opening
-		const u64 raw_device_size = get_raw_device_size(fd);
+		// Try to retrieve the size of the content. If the drive answers but reports nothing, no
+		// disc is probably mounted so abort the file opening; if it refuses the query outright
+		// the node is no raw device, and it is opened as the ordinary file it is below
+		bool size_refused = false;
+		const u64 raw_device_size = get_raw_device_size(fd, &size_refused);
 
-		if (!raw_device_size)
+		if (raw_device_size)
+		{
+			m_file = std::make_unique<unix_file>(fd, raw_device_size);
+			return;
+		}
+
+		if (!size_refused)
 		{
 			::close(fd);
 			g_tls_error = fs::error::noent;
 			return;
 		}
-
-		m_file = std::make_unique<unix_file>(fd, raw_device_size);
-		return;
 	}
 
 	m_file = std::make_unique<unix_file>(fd);
